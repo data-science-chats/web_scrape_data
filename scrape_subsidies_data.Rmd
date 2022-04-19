@@ -1,0 +1,207 @@
+---
+title: "scrape_subsidies_data"
+author: "Haley Epperly"
+date: '2022-04-19'
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Objective: Web scrape subsidies data (4 categories of subsidies plus total) for each year
+available (2010-2019, 2020 not finished) and every county in the US from 
+the [EWG website](https://farm.ewg.org/index.php).
+
+```{r, load libraries}
+library(tidyverse)
+library(rvest)
+library(janitor)
+library(stringr)
+library(here)
+library(tidycensus)
+library(usmap)
+```
+
+
+First go through step by step without any pipes
+```{r, without pipes}
+url <- 'https://farm.ewg.org/region.php?fips=53000&progcode=total&yr='
+year <- 2017
+
+#Read in the content from a .html file. This is generalized, reading in all body text. 
+#Only need to input url.
+step1 <- read_html(paste0(url,year))
+
+#find HTML element using CSS selectors:
+#read in identifying code from website for exact portion of website that you
+#are interested in. (use inspect to find this path)
+step2 <- html_elements(step1, "#main_content_area > script:nth-child(7)")
+
+#convert html to text (retrieves text from specified element)
+step3 <- html_text2(step2)
+step3
+
+#can see that each county start with their fips code in the form of C00000
+#we need to split up this big chunk of html code by county
+#code below says split the text every time you see a C with 5 numbers after it that
+#range from 0 to 9
+step3_5 <- strsplit(step3, "(C[0-9]{5})", perl = TRUE)
+
+#however, that code above actually removes the fips codes when it splits by them
+#in order to keep the fips code, we need to add some additional symbols
+step4 <- strsplit(step3, "(?<=.)(?=(C[0-9]{5}))", perl = TRUE)
+
+#convert to dataframe to visualize better
+step5 <- as.data.frame(step4)
+
+#can see first row does not correspond to any fips code
+#this was the html text that was before the first fips code
+#delete that first row
+#step6 <- step5[-1,]
+#test9 <- as.data.frame(test9)
+step6 <- as.data.frame(step5[-1,])
+
+#now we want to create two columns, one with fips codes and the other one with 
+#all the other data
+#look at rows of html text in step 6 - can see we need to separate by ",value
+#this time we are okay with it removing those characters when we separate by them
+#we have to use \\ to "escape" certain characters - this lets us use a " in code
+#without it thinking it means something in the code
+step7 <- str_split_fixed(step6[,1], '\\",value', 2)
+
+step8 <- as.data.frame(step7)
+  
+#look at rows of html text in step 7 - can see that the values I want (subsidies)
+#all start with a $, so now we need to split the second column wherever it encounters
+#a dollar sign. We know we have 5 subsidies (can see 5 $) and that the text before
+#the first dollar sign will also be kept, so we need to specify 6 columns.
+#Again we have to "escape" the character used ($)
+step9 <- separate(step8, col = V2, sep='\\$', into=c('x','total','commodity','conservation', 'disaster','insurance'), remove=TRUE) 
+
+#We can get rid of that first new column (x) with the html text before the first subsidy
+step10 <- step9[,-2]
+
+#now need to get rid of all the text after the subsidy amount in each column
+#can look at columns and see what comes after the subsidy amount
+#only first column had  "</b>" right after the subsidy amount, but all other columns had </td>.
+#use gsub to replace the pattern and everything after the pattern with nothing 
+step10[,c(3:6)] <-lapply(step10[,c(3:6)], gsub, pattern = '</td>.*', replacement = "")
+step10[,2] <- gsub(step10[,2], pattern = '</b>.*', replacement = "")
+  
+#the subsidy values include commas, which we need to remove to read as.numeric
+#use gsub again to replace all commas with nothing
+step10[,c(2:6)] <-lapply(step10[,c(2:6)], gsub, pattern = ',', replacement = "")
+
+#add in year variable
+step10$year <- 2017
+
+#rename first column to fips
+step11 <- rename(step10, fips = V1)
+
+#remove leading C on fips values and convert to numeric
+step11[,1] <- gsub(step11[,1], pattern = 'C', replacement = "")
+```
+
+
+Combine that all up into a function with pipes
+```{r, function}
+sub_scrape <- function(url, year){ 
+  read_html(paste0(url,year)) %>% 
+  html_elements("#main_content_area > script:nth-child(7)") %>% 
+  html_text2() %>% 
+  strsplit("(?<=.)(?=(C[0-9]{5}))",perl = TRUE) %>% 
+  as.data.frame() %>% 
+  .[-1,] %>% 
+  str_split_fixed('\\",value', 2) %>% 
+  as.data.frame() %>% 
+  separate(V2, sep='\\$', into=c('x','total','commodity','conservation',
+                                 'disaster','insurance'), remove=TRUE) %>% 
+  .[,-2] %>% 
+  mutate(total = gsub('</b>.*', "", total)) %>% 
+  mutate(commodity = gsub('</td>.*', "", commodity)) %>% 
+  mutate(conservation = gsub('</td>.*', "", conservation)) %>%  
+  mutate(disaster = gsub('</td>.*', "", disaster)) %>% 
+  mutate(insurance = gsub('</td>.*', "", insurance)) %>% 
+  mutate(total = as.numeric(gsub(',', "", total))) %>% 
+  mutate(commodity = as.numeric(gsub(',', "", commodity))) %>% 
+  mutate(conservation = as.numeric(gsub(',', "", conservation))) %>%  
+  mutate(disaster = as.numeric(gsub(',', "", disaster))) %>% 
+  mutate(insurance = as.numeric(gsub(',', "", insurance))) %>% 
+  add_column(Year = year) %>% 
+  rename(fips = V1) %>% 
+  mutate(fips = as.numeric(gsub('C', "", fips)))
+}
+
+#test function
+tax2 <- sub_scrape('https://farm.ewg.org/region.php?fips=53000&progcode=total&yr=', 2017)
+```
+
+
+Use function to scrape data for all states and years
+
+First, the EWG subsidy website url includes the fips code and year, so we
+need to create a vector with all state fip codes + 000 to run through the loop
+```{r}
+#load in fips codes for each county
+#this dataset is in the tidycensus package
+fips_ids <- fips_codes
+
+#add new column with just state fips (add 000 after state fips ID)
+states_fips <- paste0(fips_ids$state_code, "000") %>% 
+  #remove duplicates (duplicates are because of multiple counties per state)
+  unique() %>% 
+  #remove state codes > 60 (US territories that don't have EWG subsidies data)
+  .[. < 60000]
+```
+
+
+Run for loop to iterate through all years for WA
+```{r}
+#example using WA - loop through all available years
+url <- 'https://farm.ewg.org/region.php?fips=53000&progcode=total&yr='
+
+subsidies_data <- data.frame()
+for(year in 2010:2019){ 
+  subsidies_data_year <- sub_scrape(url,year)
+subsidies_data <- rbind(subsidies_data_year, subsidies_data)
+print(subsidies_data)
+}
+```
+
+
+Expand on for loop to iterate through all combos of years and fips codes (500 webpages).
+Don't run this - takes too long (~5-10 minutes), get 32,000 rows of data.
+```{r}
+#create empty dataframe to populate
+subsidies_data <- data.frame()
+#run through all possible fips codes in fips vector we previously created
+for(state_fip in states_fips){
+    #sprintf is a wrapper for a C function, %s says input string here
+    #including the '%s' in the url below allows us to input different fips codes
+url <- sprintf('https://farm.ewg.org/region.php?fips=%s&progcode=total&yr=', state_fip)
+#within each fips option, run through all possible years
+for(year in 2010:2019){ 
+  subsidies_data_year <- sub_scrape(url,year)
+subsidies_data <- rbind(subsidies_data_year, subsidies_data)
+print(subsidies_data)
+}
+}
+```
+
+
+Create a plot using example of WA data
+```{r, plot function}
+#read in full subsidies data
+sub_data <- read_csv(here("2010_19_us_county_subsidies_data.csv"))
+
+sub_map <- function(year, subtype) {
+  plot_usmap(data = sub_data[sub_data$Year==year,], values = subtype, size = .1)  + 
+    labs(title = str_to_title(paste(subtype, "subsidies received in", year))) +
+  scale_fill_continuous(low = "white", high = "blue", name = str_to_title(paste(subtype, "subsidies")), label = scales::comma)  +
+  theme(legend.position = "right", plot.title = element_text(size=14), legend.title = element_text(size=12))
+}
+
+sub_map(2019, "total")
+sub_map(2019, "conservation")
+sub_map(2019, "insurance")
+```
+
